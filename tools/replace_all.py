@@ -7,9 +7,12 @@ import re
 
 # 替换规则（顺序很重要：长词/大小写精确匹配优先）
 REPLACEMENTS = [
-    # API URL 替换
-    ("http://api-dashboard.yudao.iocoder.cn", "http://114.55.24.12:48080"),
-    # 品牌名替换（大写优先，避免被小写规则误覆盖）
+    # ✅ URL 替换必须放最前面（精确匹配，避免被后面的通用规则破坏）
+    ("http://api-dashboard.yudao.iocoder.cn",  "http://114.55.24.12:48080"),
+    ("http://mall.yudao.iocoder.cn",           "http://114.55.24.12:48080"),
+    ("http://localhost:48080",           "http://114.55.24.12:48080"),
+    ("http://127.0.0.1:3000",           "http://114.55.24.12:3000"),
+    # 品牌名替换（大写/长词优先）
     ("RuoYi",  "Future"),
     ("Ruoyi",  "Future"),
     ("ruoyi",  "future"),
