@@ -19,7 +19,7 @@ on:
 jobs:
   create-and-init:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     env:
       GH_PAT: ${{ secrets.GH_PAT }}
@@ -59,7 +59,6 @@ jobs:
           git clone -q --depth=1 --single-branch \
             https://gitee.com/yudaocode/yudao-ui-admin-vue3.git source
 
-          # 清理不需要的目录和文件
           rm -rf source/.git source/.gitee source/.github \
                  source/README.md source/README-zh_CN.md
 
@@ -114,15 +113,6 @@ jobs:
 
           sleep 3
 
-          # 启用 GitHub Pages（需要先有内容推送，这里先配置仓库设置）
-          curl -sS -o /dev/null -X PATCH \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_PAT}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${OWNER}/${NEW_REPO}" \
-            -d '{"has_pages": true}' \
-            || true
-
       - name: Push to new repo
         shell: bash
         run: |
@@ -143,11 +133,24 @@ jobs:
 
           rm -f ~/.git-credentials
 
-      - name: Enable GitHub Pages via API
+      - name: Wait for gh-pages branch and enable Pages
         shell: bash
         run: |
           set -euo pipefail
-          # 推送完成后，通过 API 启用 GitHub Pages（从 gh-pages 分支发布）
+          echo "⏳ 等待 pages.yml 触发并生成 gh-pages 分支..."
+          for i in $(seq 1 20); do
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${OWNER}/${NEW_REPO}/branches/gh-pages")
+            if [ "${CODE}" = "200" ]; then
+              echo "✅ gh-pages 分支已存在，启用 Pages..."
+              break
+            fi
+            echo "  第 ${i} 次检查，gh-pages 尚未就绪，等待 30s..."
+            sleep 30
+          done
+
           curl -sS \
             -X POST \
             -H "Accept: application/vnd.github+json" \
@@ -155,4 +158,4 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${OWNER}/${NEW_REPO}/pages" \
             -d '{"source": {"branch": "gh-pages", "path": "/"}}' \
-            || echo "⚠️ Pages API 调用失败（可能需要先触发一次构建生成 gh-pages 分支）"
+            || echo "⚠️ Pages 可能已启用，忽略此错误"
