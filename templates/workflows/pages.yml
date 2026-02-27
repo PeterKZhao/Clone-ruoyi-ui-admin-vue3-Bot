@@ -48,12 +48,12 @@ jobs:
 
       - name: Build
         run: |
-          # ✅ 修复1：正确的编译命令（对应 --mode prod，读取 .env.prod）
-          # ✅ 修复2：覆盖 .env.prod 中的 localhost 为真实服务器地址
-          # ✅ 修复3：覆盖输出目录为 dist，方便后续步骤统一处理
+          REPO_NAME=$(basename $(git remote get-url origin) .git)
+          echo "📦 仓库名: ${REPO_NAME}，设置 VITE_BASE_PATH=/${REPO_NAME}/"
           VITE_BASE_URL=http://114.55.24.12:48080 \
           VITE_MALL_H5_DOMAIN=http://114.55.24.12:48080 \
           VITE_OUT_DIR=dist \
+          VITE_BASE_PATH=/${REPO_NAME}/ \
           pnpm build:prod
 
       - name: Verify dist
