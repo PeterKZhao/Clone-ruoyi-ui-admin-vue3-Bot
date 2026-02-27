@@ -156,6 +156,3 @@ jobs:
             "https://api.github.com/repos/${OWNER}/${NEW_REPO}/pages" \
             -d '{"source": {"branch": "gh-pages", "path": "/"}}' \
             || echo "⚠️ Pages API 调用失败（可能需要先触发一次构建生成 gh-pages 分支）"
-
-      - name: Copy secrets to new repository
-        run: python3 tools/copy_secrets.py
