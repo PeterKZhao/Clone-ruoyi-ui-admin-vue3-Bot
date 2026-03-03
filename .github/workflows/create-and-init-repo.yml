@@ -22,8 +22,7 @@ jobs:
     timeout-minutes: 60
 
     env:
-      GH_PAT: ${{ secrets.GH_PAT }}
-      OWNER: PeterKZhao
+      ORG: FutureTechQuant
       NEW_REPO: ${{ github.event.inputs.repo_name }}
       REPO_DESC: ${{ github.event.inputs.repo_description }}
       PRIVATE: ${{ github.event.inputs.private }}
@@ -31,6 +30,20 @@ jobs:
     steps:
       - name: Checkout Clone-Bot
         uses: actions/checkout@v4
+
+      - name: Generate GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ env.ORG }}
+
+      - name: Export APP_TOKEN
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "APP_TOKEN=${{ steps.app-token.outputs.token }}" >> "$GITHUB_ENV"
 
       - name: Install Python dependencies
         run: pip install -q -r tools/requirements.txt
@@ -40,15 +53,15 @@ jobs:
         run: |
           set -euo pipefail
           CODE="$(curl -sS -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Authorization: Bearer ${APP_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${OWNER}/${NEW_REPO}")"
+            "https://api.github.com/repos/${ORG}/${NEW_REPO}")"
 
           if [ "${CODE}" = "200" ]; then
             curl -sS -o /dev/null -X DELETE \
-              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Authorization: Bearer ${APP_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${OWNER}/${NEW_REPO}"
+              "https://api.github.com/repos/${ORG}/${NEW_REPO}"
             sleep 3
           fi
 
@@ -87,7 +100,7 @@ jobs:
           cp -a source/. repo_content/
           rm -rf source
 
-      - name: Create new GitHub repo
+      - name: Create new GitHub repo (org)
         shell: bash
         run: |
           set -euo pipefail
@@ -97,9 +110,9 @@ jobs:
           RESP="$(curl -sS \
             -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Authorization: Bearer ${APP_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/user/repos \
+            "https://api.github.com/orgs/${ORG}/repos" \
             -d "{
               \"name\": \"${NEW_REPO}\",
               \"description\": \"${REPO_DESC}\",
@@ -119,7 +132,7 @@ jobs:
           set -euo pipefail
 
           git config --global credential.helper store
-          echo "https://${OWNER}:${GH_PAT}@github.com" > ~/.git-credentials
+          echo "https://x-access-token:${APP_TOKEN}@github.com" > ~/.git-credentials
 
           cd repo_content
           git init -q
@@ -128,7 +141,7 @@ jobs:
           git add .
           git commit -q -m "Initial commit: 梦开始的地方"
           git branch -M master
-          git remote add origin "https://github.com/${OWNER}/${NEW_REPO}.git"
+          git remote add origin "https://github.com/${ORG}/${NEW_REPO}.git"
           git push -q -u origin master
 
           rm -f ~/.git-credentials
@@ -140,9 +153,10 @@ jobs:
           echo "⏳ 等待 pages.yml 触发并生成 gh-pages 分支..."
           for i in $(seq 1 20); do
             CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Authorization: Bearer ${APP_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${OWNER}/${NEW_REPO}/branches/gh-pages")
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${ORG}/${NEW_REPO}/branches/gh-pages")
             if [ "${CODE}" = "200" ]; then
               echo "✅ gh-pages 分支已存在，启用 Pages..."
               break
@@ -154,8 +168,8 @@ jobs:
           curl -sS \
             -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Authorization: Bearer ${APP_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${OWNER}/${NEW_REPO}/pages" \
+            "https://api.github.com/repos/${ORG}/${NEW_REPO}/pages" \
             -d '{"source": {"branch": "gh-pages", "path": "/"}}' \
             || echo "⚠️ Pages 可能已启用，忽略此错误"
