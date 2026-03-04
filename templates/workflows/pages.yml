@@ -5,7 +5,6 @@ on:
     branches: [ master ]
   workflow_dispatch:
 
-# deploy-pages 要求 pages:write + id-token:write
 permissions:
   contents: read
   pages: write
@@ -51,13 +50,11 @@ jobs:
           npm config set registry https://registry.npmmirror.com
           pnpm install
 
-      - name: Build
-        env:
-          REPO_NAME: ${{ github.event.repository.name }}
+      - name: Build (base=/)
         run: |
-          echo "Repo: ${REPO_NAME}, set VITE_BASE_PATH=/${REPO_NAME}/"
+          echo "Set VITE_BASE_PATH=/ for custom domain root"
           VITE_OUT_DIR=dist \
-          VITE_BASE_PATH=/${REPO_NAME}/ \
+          VITE_BASE_PATH=/ \
           pnpm build:prod
 
       - name: Upload Pages artifact
