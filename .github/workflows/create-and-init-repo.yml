@@ -1,4 +1,4 @@
-name: Create and init Vue3 UI repo (org, Pages via Actions)
+name: Create and init Vue3 UI repo (org, Pages + Cloudflare full auto)
 
 on:
   workflow_dispatch:
@@ -26,22 +26,23 @@ on:
         required: false
         default: "true"
       confirm_delete:
-        description: "删除确认（默认已填 DELETE；如不想删可把 delete_existing 设为 false）"
+        description: "删除确认（默认已填 DELETE；如不想删把 delete_existing=false）"
         required: false
         default: "DELETE"
 
+      # 自定义域名 + 全自动
       custom_domain:
         description: "Pages 自定义域名（例如：admin.fscitech.net；留空则不绑定）"
         required: false
         default: "admin.fscitech.net"
-
       enforce_https:
         description: "是否在 Pages 上强制 HTTPS (true/false)"
         required: false
         default: "true"
 
+      # Cloudflare DNS 自动写入
       cloudflare_dns:
-        description: "是否自动在 Cloudflare 写入 CNAME 记录 (true/false)"
+        description: "是否自动在 Cloudflare 写入 CNAME (true/false)"
         required: false
         default: "true"
       cloudflare_proxied:
@@ -53,6 +54,10 @@ jobs:
   create-and-init:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: bash
 
     env:
       ORG: FutureTechQuant
@@ -70,6 +75,7 @@ jobs:
       CF_DNS: ${{ github.event.inputs.cloudflare_dns }}
       CF_PROXIED: ${{ github.event.inputs.cloudflare_proxied }}
 
+      # org secrets
       CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE }}
       CF_API_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
 
@@ -86,16 +92,16 @@ jobs:
           owner: ${{ env.ORG }}
 
       - name: Export APP_TOKEN
-        shell: bash
         run: |
           set -euo pipefail
           echo "APP_TOKEN=${{ steps.app-token.outputs.token }}" >> "$GITHUB_ENV"
 
       - name: Install Python dependencies
-        run: pip install -q -r tools/requirements.txt
+        run: |
+          set -euo pipefail
+          pip install -q -r tools/requirements.txt
 
       - name: Delete existing repo if exists (default ON)
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -141,7 +147,6 @@ jobs:
           fi
 
       - name: Clone from Gitee
-        shell: bash
         run: |
           set -euo pipefail
           git clone -q --depth=1 --single-branch \
@@ -151,29 +156,20 @@ jobs:
                  source/README.md source/README-zh_CN.md
 
       - name: Replace text content
-        shell: bash
         run: |
           set -euo pipefail
           (cd source && python3 ../tools/replace_all.py)
 
       - name: Copy workflow templates into new repo
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p source/.github/workflows
-
-          if [ ! -f "templates/workflows/pages.yml" ]; then
-            echo "ERROR: templates/workflows/pages.yml not found"
-            exit 1
-          fi
-
           cp -f templates/workflows/pages.yml source/.github/workflows/pages.yml
 
           sed -i "s/branches: \\\\[ master \\\\]/branches: [ ${DEFAULT_BRANCH} ]/g" source/.github/workflows/pages.yml || true
           sed -i "s/branches: \\\\[ main \\\\]/branches: [ ${DEFAULT_BRANCH} ]/g" source/.github/workflows/pages.yml || true
 
       - name: Prepare repo content
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p repo_content
@@ -181,16 +177,14 @@ jobs:
           rm -rf source
 
       - name: Create new GitHub repo (org) with retry
-        shell: bash
         run: |
           set -euo pipefail
 
           PRIVATE_BOOL=$( [ "${PRIVATE}" = "true" ] && echo true || echo false )
 
-          create_repo() {
-            local resp_file http_code
-            resp_file="$(mktemp)"
-            http_code="$(curl -sS -o "${resp_file}" -w "%{http_code}" \
+          for i in {1..5}; do
+            RESP_FILE="$(mktemp)"
+            HTTP_CODE="$(curl -sS -o "${RESP_FILE}" -w "%{http_code}" \
               -X POST \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer ${APP_TOKEN}" \
@@ -201,25 +195,18 @@ jobs:
                 \"description\": \"${REPO_DESC}\",
                 \"private\": ${PRIVATE_BOOL}
               }")"
-            echo "${http_code}"
-            if [ "${http_code}" != "201" ]; then
-              echo "---- Response body ----"
-              cat "${resp_file}"
-              echo "-----------------------"
-            fi
-          }
 
-          for i in {1..5}; do
-            CODE="$(create_repo)"
-            if [ "${CODE}" = "201" ]; then
+            if [ "${HTTP_CODE}" = "201" ]; then
               echo "Repo created."
               break
             fi
-            echo "Create repo failed (HTTP ${CODE}), retry after 3s... (${i}/5)"
+
+            echo "Create repo failed (HTTP ${HTTP_CODE}), retry after 3s... (${i}/5)"
+            cat "${RESP_FILE}" || true
             sleep 3
           done
 
-          if [ "${CODE}" != "201" ]; then
+          if [ "${HTTP_CODE}" != "201" ]; then
             echo "ERROR: Failed to create repo after retries."
             exit 1
           fi
@@ -227,7 +214,6 @@ jobs:
           sleep 3
 
       - name: Push to new repo (DEFAULT_BRANCH)
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -248,7 +234,6 @@ jobs:
           rm -f ~/.git-credentials
 
       - name: Set repository default branch (recommended)
-        shell: bash
         run: |
           set -euo pipefail
           curl -sS -o /dev/null -w "%{http_code}\n" \
@@ -259,229 +244,36 @@ jobs:
             "https://api.github.com/repos/${ORG}/${NEW_REPO}" \
             -d "{\"default_branch\":\"${DEFAULT_BRANCH}\"}" || true
 
-      - name: Enable Pages (build_type=workflow)
-        shell: bash
+      - name: Cloudflare upsert CNAME (admin -> org.github.io)
+        if: ${{ github.event.inputs.cloudflare_dns == 'true' && github.event.inputs.custom_domain != '' }}
         run: |
           set -euo pipefail
 
-          echo "Enable Pages for ${ORG}/${NEW_REPO} (workflow build)"
-
-          RESP1="$(mktemp)"
-          CODE1="$(curl -sS -o "${RESP1}" -w "%{http_code}" \
-            -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${APP_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${ORG}/${NEW_REPO}/pages" \
-            -d "{
-              \"build_type\": \"workflow\",
-              \"source\": {\"branch\": \"${DEFAULT_BRANCH}\", \"path\": \"/\"}
-            }")"
-
-          if [ "${CODE1}" = "201" ]; then
-            echo "Pages created"
-          elif [ "${CODE1}" = "409" ]; then
-            echo "Pages already exists (409), continue"
-          else
-            echo "WARN: Create Pages returned HTTP ${CODE1}"
-            cat "${RESP1}" || true
-          fi
-
-          RESP2="$(mktemp)"
-          CODE2="$(curl -sS -o "${RESP2}" -w "%{http_code}" \
-            -X PUT \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${APP_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${ORG}/${NEW_REPO}/pages" \
-            -d "{
-              \"build_type\": \"workflow\",
-              \"source\": {\"branch\": \"${DEFAULT_BRANCH}\", \"path\": \"/\"}
-            }")"
-
-          if [ "${CODE2}" != "204" ] && [ "${CODE2}" != "200" ]; then
-            echo "ERROR: Update Pages failed (HTTP ${CODE2})."
-            cat "${RESP2}"
+          if [ -z "${CF_ZONE_ID}" ] || [ -z "${CF_API_TOKEN}" ]; then
+            echo "ERROR: missing Cloudflare secrets CLOUDFLARE_ZONE / CLOUDFLARE_TOKEN"
             exit 1
           fi
 
-      - name: Custom domain end-to-end (Cloudflare DNS -> GitHub Pages -> HTTPS)
-        shell: bash
+          python3 tools/cf_upsert_cname.py \
+            --zone-id "${CF_ZONE_ID}" \
+            --token "${CF_API_TOKEN}" \
+            --name "${CUSTOM_DOMAIN}" \
+            --target "${ORG,,}.github.io" \
+            --proxied "${CF_PROXIED}"
+
+      - name: Configure GitHub Pages domain/https (script)
+        if: ${{ github.event.inputs.custom_domain != '' }}
         run: |
           set -euo pipefail
+          python3 tools/gh_pages_domain.py \
+            --org "${ORG}" \
+            --repo "${NEW_REPO}" \
+            --branch "${DEFAULT_BRANCH}" \
+            --token "${APP_TOKEN}" \
+            --cname "${CUSTOM_DOMAIN}" \
+            --enforce-https "${ENFORCE_HTTPS}"
 
-          if [ -z "${CUSTOM_DOMAIN}" ]; then
-            echo "CUSTOM_DOMAIN empty, skip"
-            exit 0
-          fi
-
-          TARGET="${ORG,,}.github.io"
-          PAGES_API="https://api.github.com/repos/${ORG}/${NEW_REPO}/pages"
-
-          echo "1) Upsert Cloudflare CNAME (optional but recommended to do first)"
-          if [ "${CF_DNS}" != "true" ]; then
-            echo "CF_DNS=false, skip Cloudflare DNS"
-          elif [ -z "${CF_ZONE_ID}" ] || [ -z "${CF_API_TOKEN}" ]; then
-            echo "ERROR: Cloudflare secrets missing (CLOUDFLARE_ZONE/CLOUDFLARE_TOKEN)"
-            exit 1
-          else
-            PROXIED_BOOL=$( [ "${CF_PROXIED}" = "true" ] && echo true || echo false )
-
-            LIST_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${CUSTOM_DOMAIN}"
-            RESP_L="$(mktemp)"
-            curl -sS -o "${RESP_L}" \
-              -H "Authorization: Bearer ${CF_API_TOKEN}" \
-              -H "Content-Type: application/json" \
-              "${LIST_URL}"
-
-            REC_ID="$(python3 - <<'PY'
-import json,sys
-p=sys.argv[1]
-data=json.load(open(p,'r',encoding='utf-8'))
-res=data.get('result') or []
-print(res[0].get('id','') if res else '')
-PY
-"${RESP_L}")"
-
-            if [ -n "${REC_ID}" ]; then
-              echo "Cloudflare record exists, updating id=${REC_ID}"
-              PUT_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${REC_ID}"
-              RESP_U="$(mktemp)"
-              CODE_U="$(curl -sS -o "${RESP_U}" -w "%{http_code}" \
-                -X PUT \
-                -H "Authorization: Bearer ${CF_API_TOKEN}" \
-                -H "Content-Type: application/json" \
-                "${PUT_URL}" \
-                -d "{
-                  \"type\": \"CNAME\",
-                  \"name\": \"${CUSTOM_DOMAIN}\",
-                  \"content\": \"${TARGET}\",
-                  \"ttl\": 1,
-                  \"proxied\": ${PROXIED_BOOL}
-                }")"
-              if [ "${CODE_U}" != "200" ]; then
-                echo "ERROR: Cloudflare update failed (HTTP ${CODE_U})"
-                cat "${RESP_U}"
-                exit 1
-              fi
-            else
-              echo "Cloudflare record not found, creating"
-              POST_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
-              RESP_C="$(mktemp)"
-              CODE_C="$(curl -sS -o "${RESP_C}" -w "%{http_code}" \
-                -X POST \
-                -H "Authorization: Bearer ${CF_API_TOKEN}" \
-                -H "Content-Type: application/json" \
-                "${POST_URL}" \
-                -d "{
-                  \"type\": \"CNAME\",
-                  \"name\": \"${CUSTOM_DOMAIN}\",
-                  \"content\": \"${TARGET}\",
-                  \"ttl\": 1,
-                  \"proxied\": ${PROXIED_BOOL}
-                }")"
-              if [ "${CODE_C}" != "200" ] && [ "${CODE_C}" != "201" ]; then
-                echo "ERROR: Cloudflare create failed (HTTP ${CODE_C})"
-                cat "${RESP_C}"
-                exit 1
-              fi
-            fi
-          fi
-
-          echo "2) Set GitHub Pages cname (DO NOT send https_enforced here)"
-          # 关键点：先只设置 cname，让 GitHub 自己去做 DNS 校验/证书签发
-          # 避免你遇到的 404: The certificate does not exist yet
-          CNAME_OK="false"
-          for i in {1..30}; do
-            RESP_P="$(mktemp)"
-            CODE_P="$(curl -sS -o "${RESP_P}" -w "%{http_code}" \
-              -X PUT \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${APP_TOKEN}" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "${PAGES_API}" \
-              -d "{
-                \"cname\": \"${CUSTOM_DOMAIN}\",
-                \"build_type\": \"workflow\",
-                \"source\": {\"branch\": \"${DEFAULT_BRANCH}\", \"path\": \"/\"}
-              }")"
-
-            if [ "${CODE_P}" = "204" ] || [ "${CODE_P}" = "200" ]; then
-              CNAME_OK="true"
-              break
-            fi
-
-            # 如果 GitHub 仍然返回证书未就绪，先等待再重试（不立刻失败）
-            if [ "${CODE_P}" = "404" ] && grep -q "certificate does not exist yet" "${RESP_P}"; then
-              echo "  GitHub says cert not ready yet (404). Sleep 20s... (${i}/30)"
-              sleep 20
-              continue
-            fi
-
-            echo "ERROR: Set Pages cname failed (HTTP ${CODE_P})."
-            cat "${RESP_P}"
-            exit 1
-          done
-
-          if [ "${CNAME_OK}" != "true" ]; then
-            echo "WARN: Could not set cname yet. You can rerun workflow later."
-            exit 0
-          fi
-
-          echo "3) Enforce HTTPS (optional, after cert exists)"
-          if [ "${ENFORCE_HTTPS}" != "true" ]; then
-            echo "ENFORCE_HTTPS=false, done."
-            exit 0
-          fi
-
-          CERT_OK="false"
-          for i in {1..90}; do
-            RESP_G="$(mktemp)"
-            CODE_G="$(curl -sS -o "${RESP_G}" -w "%{http_code}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${APP_TOKEN}" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "${PAGES_API}")"
-
-            if [ "${CODE_G}" = "200" ]; then
-              if grep -q "\"https_certificate\"" "${RESP_G}" && ! grep -q "\"https_certificate\": null" "${RESP_G}"; then
-                CERT_OK="true"
-                break
-              fi
-            fi
-
-            echo "  cert not ready yet, sleep 10s... (${i}/90)"
-            sleep 10
-          done
-
-          if [ "${CERT_OK}" != "true" ]; then
-            echo "WARN: Certificate not ready yet; skip https_enforced=true for now."
-            echo "      Rerun workflow later to enable HTTPS."
-            exit 0
-          fi
-
-          RESP_H="$(mktemp)"
-          CODE_H="$(curl -sS -o "${RESP_H}" -w "%{http_code}" \
-            -X PUT \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${APP_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "${PAGES_API}" \
-            -d "{
-              \"cname\": \"${CUSTOM_DOMAIN}\",
-              \"https_enforced\": true,
-              \"build_type\": \"workflow\",
-              \"source\": {\"branch\": \"${DEFAULT_BRANCH}\", \"path\": \"/\"}
-            }")"
-
-          if [ "${CODE_H}" != "204" ] && [ "${CODE_H}" != "200" ]; then
-            echo "WARN: Enable https_enforced failed (HTTP ${CODE_H})."
-            cat "${RESP_H}"
-            exit 0
-          fi
-
-      - name: Print expected URLs
-        shell: bash
+      - name: Print URLs
         run: |
           set -euo pipefail
           echo "GitHub Pages (default) URL:"
