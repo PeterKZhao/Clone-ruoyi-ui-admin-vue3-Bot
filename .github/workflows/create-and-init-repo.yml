@@ -20,6 +20,26 @@ on:
         required: false
         default: "master"
 
+      # 安全开关：避免误删仓库
+      delete_existing:
+        description: "若同名仓库已存在，是否删除后重建 (true/false)"
+        required: false
+        default: "false"
+      confirm_delete:
+        description: "仅当 delete_existing=true 且 confirm_delete=DELETE 才会删除"
+        required: false
+        default: ""
+
+      # Pages 自定义域名 & HTTPS
+      custom_domain:
+        description: "Pages 自定义域名（例如：admin.fscitech.net；留空则不绑定）"
+        required: false
+        default: "admin.fscitech.net"
+      enforce_https:
+        description: "是否在 Pages 上强制 HTTPS (true/false；建议先 true，若报错可先 false)"
+        required: false
+        default: "true"
+
 jobs:
   create-and-init:
     runs-on: ubuntu-latest
@@ -31,6 +51,12 @@ jobs:
       REPO_DESC: ${{ github.event.inputs.repo_description }}
       PRIVATE: ${{ github.event.inputs.private }}
       DEFAULT_BRANCH: ${{ github.event.inputs.default_branch }}
+
+      DELETE_EXISTING: ${{ github.event.inputs.delete_existing }}
+      CONFIRM_DELETE: ${{ github.event.inputs.confirm_delete }}
+
+      CUSTOM_DOMAIN: ${{ github.event.inputs.custom_domain }}
+      ENFORCE_HTTPS: ${{ github.event.inputs.enforce_https }}
 
     steps:
       - name: Checkout Clone-Bot
@@ -53,10 +79,20 @@ jobs:
       - name: Install Python dependencies
         run: pip install -q -r tools/requirements.txt
 
-      - name: Delete existing repo if exists
+      - name: Delete existing repo if exists (optional)
         shell: bash
         run: |
           set -euo pipefail
+
+          if [ "${DELETE_EXISTING}" != "true" ]; then
+            echo "DELETE_EXISTING=false, skip delete"
+            exit 0
+          fi
+
+          if [ "${CONFIRM_DELETE}" != "DELETE" ]; then
+            echo "ERROR: Refuse to delete. Set confirm_delete=DELETE to proceed."
+            exit 1
+          fi
 
           CODE="$(curl -sS -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer ${APP_TOKEN}" \
@@ -104,8 +140,8 @@ jobs:
           cp -f templates/workflows/pages.yml source/.github/workflows/pages.yml
 
           # 把 pages.yml 里触发分支改成你输入的默认分支（main/master）
-          # 这里假设模板里是：branches: [ master ]
-          sed -i "s/branches: \\[ master \\]/branches: [ ${DEFAULT_BRANCH} ]/g" source/.github/workflows/pages.yml || true
+          sed -i "s/branches: \\\\[ master \\\\]/branches: [ ${DEFAULT_BRANCH} ]/g" source/.github/workflows/pages.yml || true
+          sed -i "s/branches: \\\\[ main \\\\]/branches: [ ${DEFAULT_BRANCH} ]/g" source/.github/workflows/pages.yml || true
 
       - name: Prepare repo content
         shell: bash
@@ -122,6 +158,15 @@ jobs:
 
           PRIVATE_BOOL=$( [ "${PRIVATE}" = "true" ] && echo true || echo false )
 
+          PAYLOAD="$(cat <<JSON
+          {
+            "name": "${NEW_REPO}",
+            "description": "${REPO_DESC}",
+            "private": ${PRIVATE_BOOL}
+          }
+          JSON
+          )"
+
           RESP_FILE="$(mktemp)"
           HTTP_CODE="$(curl -sS -o "${RESP_FILE}" -w "%{http_code}" \
             -X POST \
@@ -129,11 +174,7 @@ jobs:
             -H "Authorization: Bearer ${APP_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/orgs/${ORG}/repos" \
-            -d "{
-              \"name\": \"${NEW_REPO}\",
-              \"description\": \"${REPO_DESC}\",
-              \"private\": ${PRIVATE_BOOL}
-            }")"
+            -d "${PAYLOAD}")"
 
           if [ "${HTTP_CODE}" != "201" ]; then
             echo "ERROR: Failed to create repo (HTTP ${HTTP_CODE}). Response:"
@@ -164,7 +205,7 @@ jobs:
 
           rm -f ~/.git-credentials
 
-      - name: Set repository default branch (optional but recommended)
+      - name: Set repository default branch (recommended)
         shell: bash
         run: |
           set -euo pipefail
@@ -181,10 +222,9 @@ jobs:
           if [ "${HTTP_CODE}" != "200" ]; then
             echo "WARN: Set default_branch failed (HTTP ${HTTP_CODE}). Response:"
             cat "${RESP_FILE}"
-            # 不强制失败，继续后续 Pages
           fi
 
-      - name: Enable Pages (build_type=workflow) - scheme B
+      - name: Enable Pages (build_type=workflow)
         shell: bash
         run: |
           set -euo pipefail
@@ -211,10 +251,9 @@ jobs:
           else
             echo "WARN: Create Pages returned HTTP ${CODE1}. Response:"
             cat "${RESP_FILE1}"
-            # 不立刻退出，继续 PUT（很多情况下站点已存在或需要 PUT 修正）
           fi
 
-          # 2) Force set build_type=workflow
+          # 2) Force update to build_type=workflow + source (safe)
           RESP_FILE2="$(mktemp)"
           CODE2="$(curl -sS -o "${RESP_FILE2}" -w "%{http_code}" \
             -X PUT \
@@ -222,17 +261,56 @@ jobs:
             -H "Authorization: Bearer ${APP_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${ORG}/${NEW_REPO}/pages" \
-            -d "{\"build_type\":\"workflow\"}")"
+            -d "{
+              \"build_type\": \"workflow\",
+              \"source\": {\"branch\": \"${DEFAULT_BRANCH}\", \"path\": \"/\"}
+            }")"
 
           if [ "${CODE2}" != "204" ] && [ "${CODE2}" != "200" ]; then
-            echo "ERROR: Update Pages build_type failed (HTTP ${CODE2}). Response:"
+            echo "ERROR: Update Pages failed (HTTP ${CODE2}). Response:"
             cat "${RESP_FILE2}"
             exit 1
           fi
 
-      - name: Print expected Pages URL
+      - name: Set Pages custom domain + (optional) enforce HTTPS
         shell: bash
         run: |
           set -euo pipefail
-          echo "Expected Pages URL:"
+
+          if [ -z "${CUSTOM_DOMAIN}" ]; then
+            echo "CUSTOM_DOMAIN empty, skip custom domain binding"
+            exit 0
+          fi
+
+          HTTPS_BOOL=$( [ "${ENFORCE_HTTPS}" = "true" ] && echo true || echo false )
+
+          echo "Set Pages cname=${CUSTOM_DOMAIN}, https_enforced=${HTTPS_BOOL}"
+
+          RESP="$(mktemp)"
+          CODE="$(curl -sS -o "${RESP}" -w "%{http_code}" \
+            -X PUT \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${APP_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${ORG}/${NEW_REPO}/pages" \
+            -d "{
+              \"cname\": \"${CUSTOM_DOMAIN}\",
+              \"https_enforced\": ${HTTPS_BOOL},
+              \"build_type\": \"workflow\",
+              \"source\": {\"branch\": \"${DEFAULT_BRANCH}\", \"path\": \"/\"}
+            }")"
+
+          if [ "${CODE}" != "204" ] && [ "${CODE}" != "200" ]; then
+            echo "ERROR: Set Pages cname/https failed (HTTP ${CODE}). Response:"
+            cat "${RESP}"
+            exit 1
+          fi
+
+      - name: Print expected URLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GitHub Pages (default) URL:"
           echo "https://${ORG,,}.github.io/${NEW_REPO}/"
+          echo "Custom domain (if DNS configured):"
+          echo "https://${CUSTOM_DOMAIN}/"
