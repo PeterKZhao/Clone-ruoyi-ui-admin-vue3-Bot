@@ -36,9 +36,19 @@ on:
         required: false
         default: "admin.fscitech.net"
 
-      # 重要：默认先不强制 HTTPS，避免证书未签发时报 404
+      # 全自动：默认开启（证书未就绪会等待；超时则告警不失败）
       enforce_https:
-        description: "是否在 Pages 上强制 HTTPS (true/false；建议 DNS 就绪后再 true)"
+        description: "是否在 Pages 上强制 HTTPS (true/false)"
+        required: false
+        default: "true"
+
+      # Cloudflare：默认开启自动写 DNS
+      cloudflare_dns:
+        description: "是否自动在 Cloudflare 写入 CNAME 记录 (true/false)"
+        required: false
+        default: "true"
+      cloudflare_proxied:
+        description: "Cloudflare 是否橙云代理 (true/false，建议先 false)"
         required: false
         default: "false"
 
@@ -59,6 +69,13 @@ jobs:
 
       CUSTOM_DOMAIN: ${{ github.event.inputs.custom_domain }}
       ENFORCE_HTTPS: ${{ github.event.inputs.enforce_https }}
+
+      CF_DNS: ${{ github.event.inputs.cloudflare_dns }}
+      CF_PROXIED: ${{ github.event.inputs.cloudflare_proxied }}
+
+      # 组织 secrets（你已经有）
+      CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE }}
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
 
     steps:
       - name: Checkout Clone-Bot
@@ -156,7 +173,6 @@ jobs:
 
           cp -f templates/workflows/pages.yml source/.github/workflows/pages.yml
 
-          # 触发分支替换（模板里可能是 master 或 main）
           sed -i "s/branches: \\\\[ master \\\\]/branches: [ ${DEFAULT_BRANCH} ]/g" source/.github/workflows/pages.yml || true
           sed -i "s/branches: \\\\[ main \\\\]/branches: [ ${DEFAULT_BRANCH} ]/g" source/.github/workflows/pages.yml || true
 
@@ -293,7 +309,7 @@ jobs:
             exit 1
           fi
 
-      - name: Set Pages custom domain + (optional) enforce HTTPS (wait cert)
+      - name: Set Pages cname + Cloudflare DNS + (optional) enforce HTTPS
         shell: bash
         run: |
           set -euo pipefail
@@ -305,9 +321,9 @@ jobs:
 
           PAGES_API="https://api.github.com/repos/${ORG}/${NEW_REPO}/pages"
 
-          echo "1) Set Pages cname=${CUSTOM_DOMAIN} (https_enforced=false first)"
-          RESP1="$(mktemp)"
-          CODE1="$(curl -sS -o "${RESP1}" -w "%{http_code}" \
+          echo "A) Set Pages cname=${CUSTOM_DOMAIN} (https_enforced=false first)"
+          RESP_P1="$(mktemp)"
+          CODE_P1="$(curl -sS -o "${RESP_P1}" -w "%{http_code}" \
             -X PUT \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${APP_TOKEN}" \
@@ -320,20 +336,84 @@ jobs:
               \"source\": {\"branch\": \"${DEFAULT_BRANCH}\", \"path\": \"/\"}
             }")"
 
-          if [ "${CODE1}" != "204" ] && [ "${CODE1}" != "200" ]; then
-            echo "ERROR: Set Pages cname failed (HTTP ${CODE1})."
-            cat "${RESP1}"
+          if [ "${CODE_P1}" != "204" ] && [ "${CODE_P1}" != "200" ]; then
+            echo "ERROR: Set Pages cname failed (HTTP ${CODE_P1})."
+            cat "${RESP_P1}"
             exit 1
           fi
 
+          echo "B) Upsert Cloudflare CNAME (if enabled)"
+          if [ "${CF_DNS}" != "true" ]; then
+            echo "CF_DNS=false, skip Cloudflare DNS"
+          elif [ -z "${CF_ZONE_ID}" ] || [ -z "${CF_API_TOKEN}" ]; then
+            echo "WARN: Cloudflare secrets missing (CLOUDFLARE_ZONE/CLOUDFLARE_TOKEN), skip"
+          else
+            TARGET="${ORG,,}.github.io"
+            PROXIED_BOOL=$( [ "${CF_PROXIED}" = "true" ] && echo true || echo false )
+
+            LIST_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${CUSTOM_DOMAIN}"
+            RESP_L="$(mktemp)"
+            curl -sS -o "${RESP_L}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${LIST_URL}"
+
+            REC_ID="$(jq -r '.result[0].id // empty' "${RESP_L}")"
+
+            if [ -n "${REC_ID}" ]; then
+              echo "Cloudflare record exists, updating id=${REC_ID}"
+              PUT_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${REC_ID}"
+              RESP_U="$(mktemp)"
+              CODE_U="$(curl -sS -o "${RESP_U}" -w "%{http_code}" \
+                -X PUT \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "${PUT_URL}" \
+                -d "{
+                  \"type\": \"CNAME\",
+                  \"name\": \"${CUSTOM_DOMAIN}\",
+                  \"content\": \"${TARGET}\",
+                  \"ttl\": 1,
+                  \"proxied\": ${PROXIED_BOOL}
+                }")"
+              if [ "${CODE_U}" != "200" ]; then
+                echo "ERROR: Cloudflare update failed (HTTP ${CODE_U})"
+                cat "${RESP_U}"
+                exit 1
+              fi
+            else
+              echo "Cloudflare record not found, creating"
+              POST_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
+              RESP_C="$(mktemp)"
+              CODE_C="$(curl -sS -o "${RESP_C}" -w "%{http_code}" \
+                -X POST \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "${POST_URL}" \
+                -d "{
+                  \"type\": \"CNAME\",
+                  \"name\": \"${CUSTOM_DOMAIN}\",
+                  \"content\": \"${TARGET}\",
+                  \"ttl\": 1,
+                  \"proxied\": ${PROXIED_BOOL}
+                }")"
+              if [ "${CODE_C}" != "200" ] && [ "${CODE_C}" != "201" ]; then
+                echo "ERROR: Cloudflare create failed (HTTP ${CODE_C})"
+                cat "${RESP_C}"
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "C) Enforce HTTPS (optional)"
           if [ "${ENFORCE_HTTPS}" != "true" ]; then
             echo "ENFORCE_HTTPS=false, done."
             exit 0
           fi
 
-          echo "2) Wait for GitHub to provision HTTPS certificate (poll GET /pages)"
+          echo "Wait for GitHub Pages certificate to be provisioned (poll GET /pages)..."
           CERT_OK="false"
-          for i in {1..60}; do
+          for i in {1..90}; do
             RESP_G="$(mktemp)"
             CODE_G="$(curl -sS -o "${RESP_G}" -w "%{http_code}" \
               -H "Accept: application/vnd.github+json" \
@@ -348,19 +428,19 @@ jobs:
               fi
             fi
 
-            echo "  cert not ready yet, sleep 10s... (${i}/60)"
+            echo "  cert not ready yet, sleep 10s... (${i}/90)"
             sleep 10
           done
 
           if [ "${CERT_OK}" != "true" ]; then
             echo "WARN: Certificate not ready yet; skip https_enforced=true for now."
-            echo "      After DNS is configured and cert is issued, rerun workflow with enforce_https=true."
+            echo "      You can rerun workflow later to enable HTTPS."
             exit 0
           fi
 
-          echo "3) Enable https_enforced=true"
-          RESP2="$(mktemp)"
-          CODE2="$(curl -sS -o "${RESP2}" -w "%{http_code}" \
+          echo "Enable https_enforced=true"
+          RESP_P2="$(mktemp)"
+          CODE_P2="$(curl -sS -o "${RESP_P2}" -w "%{http_code}" \
             -X PUT \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${APP_TOKEN}" \
@@ -373,9 +453,9 @@ jobs:
               \"source\": {\"branch\": \"${DEFAULT_BRANCH}\", \"path\": \"/\"}
             }")"
 
-          if [ "${CODE2}" != "204" ] && [ "${CODE2}" != "200" ]; then
-            echo "WARN: Enable https_enforced failed (HTTP ${CODE2})."
-            cat "${RESP2}"
+          if [ "${CODE_P2}" != "204" ] && [ "${CODE_P2}" != "200" ]; then
+            echo "WARN: Enable https_enforced failed (HTTP ${CODE_P2})."
+            cat "${RESP_P2}"
             exit 0
           fi
 
@@ -385,5 +465,5 @@ jobs:
           set -euo pipefail
           echo "GitHub Pages (default) URL:"
           echo "https://${ORG,,}.github.io/${NEW_REPO}/"
-          echo "Custom domain (if DNS configured):"
+          echo "Custom domain (after DNS ready):"
           echo "https://${CUSTOM_DOMAIN}/"
