@@ -150,7 +150,7 @@ jobs:
         run: |
           set -euo pipefail
           git clone -q --depth=1 --single-branch \
-            https://gitee.com/yudaocode/yudao-ui-admin-vue3.git source
+            https://github.com/FutureTechQuant/yudao-ui-admin-vue3.git source
 
           rm -rf source/.git source/.gitee source/.github \
                  source/README.md source/README-zh_CN.md
